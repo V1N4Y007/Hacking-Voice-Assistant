@@ -6,3 +6,4 @@ build/
 *.spec
 *.exe
 *.pkg
+report_sender.py

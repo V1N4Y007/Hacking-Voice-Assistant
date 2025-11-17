@@ -7,6 +7,7 @@ from datetime import datetime
 import subprocess
 import time
 import queue
+import re
 
 
 class HackSpeakGUI:
@@ -17,6 +18,16 @@ class HackSpeakGUI:
         self.current_thread = None
         self.engine = None  # Initialize TTS engine attribute
         self.recognizer = None  # Initialize speech recognition attribute
+        
+        # Detector attributes (non-admin mode)
+        self.detector_thread = None
+        self.detector_stop_event = threading.Event()
+        self.detector_running = False
+        self.detector_baseline = {}
+        self.detector_baseline_dns = []
+        self.detector_baseline_ip = None
+        self.detector_gateway = None
+        self.detector_poll_interval = 10  # seconds
         
         # Initialize tkinter
         self.root = tk.Tk()
@@ -617,27 +628,142 @@ class HackSpeakGUI:
                 
         threading.Thread(target=worker, daemon=True).start()
     
+    # ----------------------------
+    # Integrated non-admin detector
+    # ----------------------------
+    def _run_cmd(self, args, timeout=6):
+        try:
+            completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, shell=False)
+            return completed.stdout + completed.stderr
+        except Exception:
+            return ""
+
+    def _parse_arp_output(self, arp_text):
+        table = {}
+        for line in arp_text.splitlines():
+            m_ip = re.search(r"(\d{1,3}(?:\.\d{1,3}){3})", line)
+            m_mac = re.search(r"([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})", line)
+            if m_ip and m_mac:
+                ip = m_ip.group(1)
+                mac = m_mac.group(1).replace("-", ":").lower()
+                table[ip] = mac
+        return table
+
+    def _get_gateway_from_ipconfig(self):
+        out = self._run_cmd(["ipconfig", "/all"])
+        m = re.search(r"Default Gateway[^\r\n:]*:\s*([\d\.]+)", out)
+        if m:
+            return m.group(1)
+        return None
+
+    def _get_dns_servers(self):
+        out = self._run_cmd(["ipconfig", "/all"])
+        dns = re.findall(r"DNS Servers[^\r\n:]*:\s*([\d\.]+)", out)
+        return dns
+
+    def _get_public_ip(self):
+        # best-effort public IP without adding requests dependency
+        try:
+            import urllib.request, urllib.error
+            with urllib.request.urlopen("https://api.ipify.org", timeout=6) as resp:
+                return resp.read().decode().strip()
+        except Exception:
+            return None
+
+    def _take_detector_baseline(self):
+        arp = self._parse_arp_output(self._run_cmd(["arp", "-a"]))
+        self.detector_baseline = arp
+        self.detector_baseline_dns = self._get_dns_servers() or []
+        self.detector_baseline_ip = self._get_public_ip()
+        self.detector_gateway = self.detector_gateway or self._get_gateway_from_ipconfig()
+
+    def _detector_check_once(self):
+        alerts = []
+        curr_arp = self._parse_arp_output(self._run_cmd(["arp", "-a"]))
+        # watch gateway and baseline keys
+        keys = set(self.detector_baseline.keys()) | ({self.detector_gateway} if self.detector_gateway else set())
+        for ip in keys:
+            if not ip:
+                continue
+            base_mac = self.detector_baseline.get(ip)
+            curr_mac = curr_arp.get(ip)
+            if base_mac and curr_mac and base_mac != curr_mac:
+                alerts.append(f"MAC changed for {ip}: was {base_mac}, now {curr_mac}")
+            if not base_mac and curr_mac:
+                alerts.append(f"New ARP entry: {ip} -> {curr_mac}")
+
+        # DNS check
+        curr_dns = self._get_dns_servers()
+        if curr_dns != self.detector_baseline_dns:
+            alerts.append(f"DNS servers changed: was {self.detector_baseline_dns}, now {curr_dns}")
+
+        # Public IP check (best-effort)
+        curr_ip = self._get_public_ip()
+        if curr_ip and self.detector_baseline_ip and curr_ip != self.detector_baseline_ip:
+            alerts.append(f"Public IP changed: was {self.detector_baseline_ip}, now {curr_ip}")
+
+        return alerts
+
+    def _detector_loop(self, poll_interval):
+        """Runs in background thread until stop_event is set"""
+        self.thread_safe_output("Light detector baseline capture in progress...", "info")
+        try:
+            self._take_detector_baseline()
+            self.thread_safe_output(f"Baseline captured. Gateway: {self.detector_gateway} | Public IP: {self.detector_baseline_ip}", "success")
+        except Exception as e:
+            self.thread_safe_output(f"Failed to capture baseline: {e}", "warning")
+
+        while not self.detector_stop_event.is_set():
+            try:
+                alerts = self._detector_check_once()
+                if alerts:
+                    self.thread_safe_output("⚠️ Network Alert:", "warning")
+                    for a in alerts:
+                        self.thread_safe_output(f" - {a}", "warning")
+                    # do not auto-update baseline — keep manual control
+                else:
+                    self.thread_safe_output("✔ Network looks normal.", "info")
+            except Exception as e:
+                self.thread_safe_output(f"Detector error: {e}", "error")
+
+            # Sleep but wake earlier if stop requested
+            for _ in range(int(poll_interval)):
+                if self.detector_stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        self.thread_safe_output("Light detector stopped.", "info")
+
     def arp_detection(self):
-        """ARP spoofing detection"""
-        def worker():
-            self.thread_safe_output("Starting ARP spoofing detection...", "info")
-            self.thread_safe_speak("Starting ARP detection")
-            
-            if self.modules.get('arp_spoof_detector'):
-                try:
-                    # Use a callback approach for continuous updates
-                    def arp_callback(message):
-                        self.thread_safe_output(message, "warning")
-                    
-                    self.modules['arp_spoof_detector'].start_arp_spoof_detector(callback=arp_callback)
-                    self.thread_safe_output("ARP detection started in background", "success")
-                except Exception as e:
-                    self.thread_safe_output(f"ARP detection error: {str(e)}", "error")
-            else:
-                self.thread_safe_output("ARP detection: Monitoring network traffic (simulated)", "info")
-                self.thread_safe_output("Note: Install scapy for full ARP detection", "warning")
-                
-        threading.Thread(target=worker, daemon=True).start()
+        """Toggle the integrated non-admin ARP/network detector"""
+        if self.detector_running:
+            # Stop it
+            self.thread_safe_output("Stopping ARP detection...", "info")
+            self.detector_stop_event.set()
+            if self.detector_thread:
+                self.detector_thread.join(timeout=3)
+            self.detector_running = False
+            # update button state if present
+            try:
+                if hasattr(self, 'arp_button') and self.arp_button:
+                    self.thread_safe_button_update(self.arp_button, None, "ARP Detection", "#F44336")
+            except Exception:
+                pass
+            self.thread_safe_status("Ready")
+            return
+
+        # Start detector
+        self.detector_stop_event.clear()
+        self.detector_thread = threading.Thread(target=self._detector_loop, args=(self.detector_poll_interval,), daemon=True)
+        self.detector_thread.start()
+        self.detector_running = True
+        try:
+            if hasattr(self, 'arp_button') and self.arp_button:
+                self.thread_safe_button_update(self.arp_button, None, "Stop ARP", "#f44336")
+        except Exception:
+            pass
+        self.thread_safe_output("ARP detection started (non-admin mode). Monitoring gateway, DNS, and public IP.", "success")
+        self.thread_safe_status("ARP Detection Active")
     
     def ask_ai(self):
         """Ask AI"""
@@ -694,6 +820,14 @@ class HackSpeakGUI:
     def exit_app(self):
         """Exit application"""
         self.stop_listening()
+        # Stop detector if running
+        try:
+            if self.detector_running:
+                self.detector_stop_event.set()
+                if self.detector_thread:
+                    self.detector_thread.join(timeout=2)
+        except Exception:
+            pass
         self.thread_safe_output("Shutting down HackSpeak Assistant...", "system")
         self.thread_safe_speak("Goodbye!")
         self.root.after(1000, self.root.quit)
