@@ -8,6 +8,15 @@ import subprocess
 import time
 import queue
 import re
+import tempfile
+import traceback
+
+# Try import report_sender helpers
+try:
+    from report_sender import generate_pdf_report, send_email_with_attachment
+    REPORT_SENDER_AVAILABLE = True
+except Exception:
+    REPORT_SENDER_AVAILABLE = False
 
 
 class HackSpeakGUI:
@@ -196,13 +205,17 @@ class HackSpeakGUI:
             ("Clean Metadata", self.clean_metadata, "#9C27B0"),
             ("Privacy Mode", self.privacy_mode, "#795548"),
             ("ARP Detection", self.arp_detection, "#F44336"),
-            ("Ask AI", self.ask_ai, "#4CAF50")
+            ("Ask AI", self.ask_ai, "#4CAF50"),
+            ("Export & Email Report", self.export_and_email_report, "#607D8B")
         ]
         
         for text, command, color in buttons:
             btn = tk.Button(features_frame, text=text, bg=color, fg="white",
                            font=("Arial", 11, "bold"), command=command, pady=5)
             btn.pack(fill="x", padx=5, pady=3)
+            if text == "ARP Detection":
+                # keep reference to arp button if needed by detector toggles
+                self.arp_button = btn
         
         # Right panel - Output
         output_panel = tk.Frame(main_frame, bg="#2d2d2d")
@@ -817,6 +830,127 @@ class HackSpeakGUI:
         
         threading.Thread(target=ai_worker, daemon=True).start()
     
+    # ----------------------------
+    # Report export & email feature
+    # ----------------------------
+    def _capture_output_text(self) -> str:
+        """Return the current content of the output pane as plain text."""
+        try:
+            return self.output_text.get("1.0", tk.END).strip()
+        except Exception:
+            return ""
+    
+    def export_and_email_report(self):
+    
+        def worker():
+            try:
+                self.thread_safe_output("Preparing report...", "info")
+                self.thread_safe_status("Generating report...")
+
+                content = self._capture_output_text()
+                if not content:
+                    self.thread_safe_output("Nothing to include in report (output is empty).", "warning")
+                    self.thread_safe_status("Ready")
+                    return
+
+                # Ask for recipients (in main thread)
+                recipients_str_holder = {"value": None}
+                def ask_recipients():
+                    recipients_str_holder["value"] = simpledialog.askstring(
+                        "Recipients", 
+                        "Enter recipient email(s) (comma-separated):"
+                    )
+                self.root.after(0, ask_recipients)
+
+                # Wait for user input
+                while recipients_str_holder["value"] is None:
+                    time.sleep(0.1)
+
+                recipients_str = recipients_str_holder["value"]
+                if not recipients_str or not recipients_str.strip():
+                    self.thread_safe_output("Report canceled: no recipients provided.", "warning")
+                    self.thread_safe_status("Ready")
+                    return
+
+                recipients = [r.strip() for r in recipients_str.split(",") if r.strip()]
+
+                # Create temp file
+                tmp_dir = os.path.join(os.path.expanduser("~"), "Desktop", "HackSpeak Reports")
+                os.makedirs(tmp_dir, exist_ok=True)
+
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"hackspeak_report_{ts}.pdf"
+                tmp_path = os.path.join(tmp_dir, filename)
+
+                # Generate PDF
+                try:
+                    generated_path = generate_pdf_report(content, tmp_path) if REPORT_SENDER_AVAILABLE else None
+                except Exception as e:
+                    self.thread_safe_output(f"Report generation error: {e}", "error")
+                    self.thread_safe_status("Ready")
+                    return
+
+                if not generated_path or not os.path.exists(generated_path):
+                    self.thread_safe_output("Failed to generate report file.", "error")
+                    self.thread_safe_status("Ready")
+                    return
+
+                self.thread_safe_output(f"Report generated: {generated_path}", "success")
+
+                # Load SMTP credentials from .env
+                smtp_info = {
+                    "host": os.getenv("SMTP_HOST"),
+                    "port": int(os.getenv("SMTP_PORT", "587")),
+                    "user": os.getenv("SMTP_USER"),
+                    "pass": os.getenv("SMTP_PASS"),
+                    "from": os.getenv("SMTP_USER"),
+                }
+
+                # Safety check
+                if not smtp_info["host"] or not smtp_info["user"] or not smtp_info["pass"]:
+                    self.thread_safe_output("Missing SMTP credentials in .env", "error")
+                    self.thread_safe_status("Ready")
+                    return
+
+
+                # Send email
+                self.thread_safe_output("Sending email...", "info")
+                self.thread_safe_status("Sending report...")
+
+                try:
+                    send_email_with_attachment(
+                        smtp_host=smtp_info["host"],
+                        smtp_port=int(smtp_info["port"]),
+                        smtp_user=smtp_info["user"],
+                        smtp_pass=smtp_info["pass"],
+                        from_addr=smtp_info["from"],
+                        to_addrs=recipients,
+                        subject="HackSpeak Report",
+                        body="Attached is your HackSpeak session report.",
+                        attachment_path=generated_path
+                    )
+                except Exception as e:
+                    self.thread_safe_output(f"Email send error: {e}", "error")
+                    self.thread_safe_status("Ready")
+                    return
+
+                self.thread_safe_output("Report emailed successfully!", "success")
+                self.thread_safe_status("Ready")
+
+                try:
+                    os.remove(generated_path)
+                except:
+                    pass
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.thread_safe_output(f"Unexpected error: {e}", "error")
+                self.thread_safe_output(tb, "error")
+                self.thread_safe_status("Ready")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
     def exit_app(self):
         """Exit application"""
         self.stop_listening()
