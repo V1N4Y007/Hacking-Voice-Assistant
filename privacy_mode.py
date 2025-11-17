@@ -3,36 +3,69 @@ import time
 import threading
 import requests
 
-def get_public_ip():
-    try:
-        response = requests.get("https://api.ipify.org")
-        return response.text
-    except:
-        return "Unable to retrieve IP"
+VPN_NAME = "VPNGateJapan"   # name you set in Windows VPN settings
+USERNAME = "vpn"
+PASSWORD = "vpn"
+IP_CHECK = "https://api.ipify.org"
 
-def connect_vpn():
+
+def get_ip():
     try:
-        subprocess.call("windscribe connect", shell=True)
-        time.sleep(3)
-        print("[Privacy Mode] ✅ VPN connected.")
-    except Exception as e:
-        print(f"[Privacy Mode] ❌ VPN connection failed: {e}")
+        return requests.get(IP_CHECK, timeout=5).text.strip()
+    except:
+        return "ERROR"
+
+
+def connect_vpn(wait_for_change=True, timeout=30):
+    print("[VPN] Connecting...")
+    result = subprocess.run(["rasdial", VPN_NAME, USERNAME, PASSWORD],
+                            capture_output=True, text=True)
+
+    if result.returncode != 0:
+        return False, f"rasdial error: {result.stderr or result.stdout}"
+
+    if not wait_for_change:
+        return True, "Connected (not verified)"
+
+    orig_ip = get_ip()
+    start = time.time()
+
+    while time.time() - start < timeout:
+        time.sleep(1.5)
+        new_ip = get_ip()
+        if new_ip != orig_ip and not new_ip.startswith("ERROR"):
+            return True, f"New IP detected → {new_ip}"
+
+    return False, "Connected, but IP did not change."
+
 
 def disconnect_vpn():
-    try:
-        subprocess.call("windscribe disconnect", shell=True)
-        print("[Privacy Mode] 🔓 VPN disconnected.")
-    except Exception as e:
-        print(f"[Privacy Mode] ❌ VPN disconnection failed: {e}")
+    print("[VPN] Disconnecting...")
+    result = subprocess.run(["rasdial", VPN_NAME, "/disconnect"],
+                            capture_output=True, text=True)
+
+    if result.returncode == 0:
+        return True, "Disconnected."
+    else:
+        return False, result.stderr or result.stdout
+
 
 def start_privacy_mode(duration=10):
-    def vpn_loop():
-        print("[Privacy Mode] 🌐 Original IP:", get_public_ip())
-        connect_vpn()
-        print("[Privacy Mode] 🧭 New IP:", get_public_ip())
-        print(f"[Privacy Mode] 🔐 Active for {duration} minutes.")
-        time.sleep(duration * 60)
-        disconnect_vpn()
-        print("[Privacy Mode] ⛔ Privacy mode ended.")
+    def worker():
+        old_ip = get_ip()
+        print("[Privacy Mode] Original IP:", old_ip)
 
-    threading.Thread(target=vpn_loop, daemon=True).start()
+        ok, msg = connect_vpn()
+        if not ok:
+            print("[Privacy Mode] ❌ Connect error:", msg)
+            return
+
+        print("[Privacy Mode] ✅", msg)
+        print(f"[Privacy Mode] Active for {duration} minutes...")
+
+        time.sleep(duration * 60)
+
+        ok, msg = disconnect_vpn()
+        print("[Privacy Mode] 🔓", msg)
+
+    threading.Thread(target=worker, daemon=False).start()
